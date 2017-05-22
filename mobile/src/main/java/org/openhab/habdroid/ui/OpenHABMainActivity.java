@@ -58,12 +58,15 @@ import com.google.android.gms.analytics.GoogleAnalytics;
 import com.google.android.gms.gcm.GoogleCloudMessaging;
 import com.loopj.android.http.AsyncHttpClient;
 import com.loopj.android.http.AsyncHttpResponseHandler;
+import com.loopj.android.http.SyncHttpClient;
 import com.loopj.android.http.TextHttpResponseHandler;
 import com.loopj.android.image.WebImageCache;
 
 import cz.msebera.android.httpclient.Header;
 import cz.msebera.android.httpclient.client.HttpResponseException;
+import cz.msebera.android.httpclient.conn.HttpHostConnectException;
 import cz.msebera.android.httpclient.entity.StringEntity;
+
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.openhab.habdroid.BuildConfig;
@@ -74,6 +77,8 @@ import org.openhab.habdroid.core.NotificationDeletedBroadcastReceiver;
 import org.openhab.habdroid.core.OpenHABTracker;
 import org.openhab.habdroid.core.OpenHABTrackerReceiver;
 import org.openhab.habdroid.core.OpenHABVoiceService;
+import org.openhab.habdroid.core.notifications.GoogleCloudMessageConnector;
+import org.openhab.habdroid.core.notifications.NotificationSettings;
 import org.openhab.habdroid.model.OpenHABLinkedPage;
 import org.openhab.habdroid.model.OpenHABSitemap;
 import org.openhab.habdroid.model.thing.ThingType;
@@ -81,6 +86,7 @@ import org.openhab.habdroid.ui.drawer.OpenHABDrawerAdapter;
 import org.openhab.habdroid.ui.drawer.OpenHABDrawerItem;
 import org.openhab.habdroid.util.Constants;
 import org.openhab.habdroid.util.MyAsyncHttpClient;
+import org.openhab.habdroid.util.MySyncHttpClient;
 import org.openhab.habdroid.util.Util;
 import org.w3c.dom.Document;
 import org.xml.sax.SAXException;
@@ -88,10 +94,13 @@ import org.xml.sax.SAXException;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
+import java.net.MalformedURLException;
+import java.net.URL;
 import java.net.URLEncoder;
 import java.util.ArrayList;
 import java.util.List;
 
+import javax.net.ssl.SSLHandshakeException;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.parsers.ParserConfigurationException;
@@ -102,7 +111,43 @@ import de.duenndns.ssl.MemorizingTrustManager;
 
 public class OpenHABMainActivity extends AppCompatActivity implements OnWidgetSelectedListener,
         OpenHABTrackerReceiver, MemorizingResponder {
-    public static final String GCM_SENDER_ID = "737820980945";
+
+    private abstract class DefaultHttpResponseHandler extends AsyncHttpResponseHandler {
+
+
+        @Override
+        public void onFailure(int statusCode, Header[] headers, byte[] responseBody, Throwable error) {
+            setProgressIndicatorVisible(false);
+            if (error instanceof HttpResponseException) {
+                switch (((HttpResponseException) error).getStatusCode()) {
+                    case 401:
+                        showAlertDialog(getString(R.string.error_authentication_failed));
+                        break;
+                    default:
+                        showError(error.getMessage());
+                }
+            } else if (error instanceof HttpHostConnectException) {
+                Log.e(TAG, "Error connecting to host");
+                showError(error.getMessage());
+            } else if (error instanceof java.net.UnknownHostException) {
+                Log.e(TAG, "Unable to resolve hostname");
+                showError(error.getMessage());
+            } else if (error instanceof SSLHandshakeException) {
+                showError(getString(R.string.error_connection_sslhandshake_failed));
+            } else {
+                Log.e(TAG, error.getClass().toString());
+            }
+        }
+
+        private void showError(String message) {
+            if (message != null) {
+                Log.e(TAG, message);
+                showAlertDialog(message);
+            } else {
+                showAlertDialog(getString(R.string.error_connection_failed));
+            }
+        }
+    }
     // GCM Registration expiration
     public static final long REGISTRATION_EXPIRY_TIME_MS = 1000 * 3600 * 24 * 7;
     // Logging TAG
@@ -119,7 +164,7 @@ public class OpenHABMainActivity extends AppCompatActivity implements OnWidgetSe
 //    private static MyAsyncHttpClient mAsyncHttpClient;
     private static AsyncHttpClient mAsyncHttpClient = new AsyncHttpClient();
     // Base URL of current openHAB connection
-    private String openHABBaseUrl = "https://demo.openhab.org:8443/";
+    private String openHABBaseUrl = "http://demo.openhab.org:8080/";
     // openHAB username
     private String openHABUsername = "";
     // openHAB password
@@ -163,7 +208,10 @@ public class OpenHABMainActivity extends AppCompatActivity implements OnWidgetSe
     private List<OpenHABDrawerItem> mDrawerItemList;
     private ProgressBar mProgressBar;
     private Boolean mIsMyOpenHAB = false;
-    private String mRegId = null;
+    private NotificationSettings mNotifySettings = null;
+
+    public static String GCM_SENDER_ID;
+
     /*
      *Daydreaming gets us into a funk when in fullscreen, this allows us to
      *reset ourselves to fullscreen.
@@ -521,7 +569,7 @@ public class OpenHABMainActivity extends AppCompatActivity implements OnWidgetSe
     private void loadSitemapList(String baseUrl) {
         Log.d(TAG, "Loading sitemap list from " + baseUrl + "rest/sitemaps");
         setProgressIndicatorVisible(true);
-        mAsyncHttpClient.get(baseUrl + "rest/sitemaps", new AsyncHttpResponseHandler() {
+        mAsyncHttpClient.get(baseUrl + "rest/sitemaps", new DefaultHttpResponseHandler() {
             @Override
             public void onSuccess(int statusCode, Header[] headers, byte[] responseBody) {
                 setProgressIndicatorVisible(false);
@@ -533,11 +581,7 @@ public class OpenHABMainActivity extends AppCompatActivity implements OnWidgetSe
                         DocumentBuilder builder = dbf.newDocumentBuilder();
                         Document sitemapsXml = builder.parse(new ByteArrayInputStream(responseBody));
                         mSitemapList.addAll(Util.parseSitemapList(sitemapsXml));
-                    } catch (ParserConfigurationException e) {
-                        e.printStackTrace();
-                    } catch (SAXException e) {
-                        e.printStackTrace();
-                    } catch (IOException e) {
+                    } catch (ParserConfigurationException | SAXException | IOException e) {
                         e.printStackTrace();
                     }
                     // Later versions work with JSON
@@ -547,9 +591,7 @@ public class OpenHABMainActivity extends AppCompatActivity implements OnWidgetSe
                         JSONArray jsonArray = new JSONArray(jsonString);
                         mSitemapList.addAll(Util.parseSitemapList(jsonArray));
                         Log.d(TAG, jsonArray.toString());
-                    } catch (UnsupportedEncodingException e) {
-                        e.printStackTrace();
-                    } catch (JSONException e) {
+                    } catch (UnsupportedEncodingException | JSONException e) {
                         e.printStackTrace();
                     }
                 }
@@ -557,40 +599,6 @@ public class OpenHABMainActivity extends AppCompatActivity implements OnWidgetSe
                     return;
                 }
                 loadDrawerItems();
-            }
-
-            @Override
-            public void onFailure(int statusCode, Header[] headers, byte[] responseBody, Throwable error) {
-                setProgressIndicatorVisible(false);
-                if (error instanceof HttpResponseException) {
-                    switch (((HttpResponseException) error).getStatusCode()) {
-                        case 401:
-                            showAlertDialog(getString(R.string.error_authentication_failed));
-                            break;
-                        default:
-                            showAlertDialog("HTTP Error: " + error.getMessage());
-                            Log.e(TAG, String.format("Http code = %d", ((HttpResponseException) error).getStatusCode()));
-                            break;
-                    }
-                } else if (error instanceof cz.msebera.android.httpclient.conn.HttpHostConnectException) {
-                    Log.e(TAG, "Error connecting to host");
-                    if (error.getMessage() != null) {
-                        Log.e(TAG, error.getMessage());
-                        showAlertDialog(error.getMessage());
-                    } else {
-                        showAlertDialog(getString(R.string.error_connection_failed));
-                    }
-                } else if (error instanceof java.net.UnknownHostException) {
-                    Log.e(TAG, "Unable to resolve hostname");
-                    if (error.getMessage() != null) {
-                        Log.e(TAG, error.getMessage());
-                        showAlertDialog(error.getMessage());
-                    } else {
-                        showAlertDialog(getString(R.string.error_connection_failed));
-                    }
-                } else {
-                    Log.e(TAG, error.getClass().toString());
-                }
             }
         });
     }
@@ -606,7 +614,7 @@ public class OpenHABMainActivity extends AppCompatActivity implements OnWidgetSe
     private void selectSitemap(final String baseUrl, final boolean forceSelect) {
         Log.d(TAG, "Loading sitemap list from " + baseUrl + "rest/sitemaps");
         setProgressIndicatorVisible(true);
-        mAsyncHttpClient.get(baseUrl + "rest/sitemaps", new AsyncHttpResponseHandler() {
+        mAsyncHttpClient.get(baseUrl + "rest/sitemaps", new DefaultHttpResponseHandler() {
 
             @Override
             public void onSuccess(int statusCode, Header[] headers, byte[] responseBody) {
@@ -620,11 +628,7 @@ public class OpenHABMainActivity extends AppCompatActivity implements OnWidgetSe
                         DocumentBuilder builder = dbf.newDocumentBuilder();
                         Document sitemapsXml = builder.parse(new ByteArrayInputStream(responseBody));
                         mSitemapList.addAll(Util.parseSitemapList(sitemapsXml));
-                    } catch (ParserConfigurationException e) {
-                        e.printStackTrace();
-                    } catch (SAXException e) {
-                        e.printStackTrace();
-                    } catch (IOException e) {
+                    } catch (ParserConfigurationException | SAXException | IOException e) {
                         e.printStackTrace();
                     }
                     // Later versions work with JSON
@@ -634,9 +638,7 @@ public class OpenHABMainActivity extends AppCompatActivity implements OnWidgetSe
                         JSONArray jsonArray = new JSONArray(jsonString);
                         mSitemapList.addAll(Util.parseSitemapList(jsonArray));
                         Log.d(TAG, jsonArray.toString());
-                    } catch (UnsupportedEncodingException e) {
-                        e.printStackTrace();
-                    } catch (JSONException e) {
+                    } catch (UnsupportedEncodingException | JSONException e) {
                         e.printStackTrace();
                     }
                 }
@@ -691,40 +693,6 @@ public class OpenHABMainActivity extends AppCompatActivity implements OnWidgetSe
                             showSitemapSelectionDialog(mSitemapList);
                         }
                     }
-                }
-            }
-
-            @Override
-            public void onFailure(int statusCode, Header[] headers, byte[] responseBody, Throwable error) {
-                setProgressIndicatorVisible(false);
-                if (error instanceof HttpResponseException) {
-                    switch (((HttpResponseException) error).getStatusCode()) {
-                        case 401:
-                            showAlertDialog(getString(R.string.error_authentication_failed));
-                            break;
-                        default:
-                            Log.e(TAG, String.format("Http code = %d", ((HttpResponseException) error).getStatusCode()));
-                            showAlertDialog("HTTP Error: " + error.getMessage());
-                            break;
-                    }
-                } else if (error instanceof cz.msebera.android.httpclient.conn.HttpHostConnectException) {
-                    Log.e(TAG, "Error connecting to host");
-                    if (error.getMessage() != null) {
-                        Log.e(TAG, error.getMessage());
-                        showAlertDialog(error.getMessage());
-                    } else {
-                        showAlertDialog(getString(R.string.error_connection_failed));
-                    }
-                } else if (error instanceof java.net.UnknownHostException) {
-                    Log.e(TAG, "Unable to resolve hostname");
-                    if (error.getMessage() != null) {
-                        Log.e(TAG, error.getMessage());
-                        showAlertDialog(error.getMessage());
-                    } else {
-                        showAlertDialog(getString(R.string.error_connection_failed));
-                    }
-                } else {
-                    Log.e(TAG, error.getClass().toString());
                 }
             }
         });
@@ -1228,69 +1196,62 @@ public class OpenHABMainActivity extends AppCompatActivity implements OnWidgetSe
     }
 
     private void gcmRegisterBackground() {
-        // We need settings
-        if (mSettings == null)
-            return;
-        // We need remote URL, username and password, without them we can't connect to my.openHAB
-        String remoteUrl = mSettings.getString(Constants.PREFERENCE_ALTURL, null);
-        if (TextUtils.isEmpty(remoteUrl) || TextUtils.isEmpty(openHABUsername) || TextUtils.isEmpty(openHABPassword)) {
-            Log.d(TAG, "Remote URL, username or password are empty, no GCM registration will be made");
-            return;
-        }
-        // We need remote URL to be my.oh
-        if (!remoteUrl.toLowerCase().startsWith("https://my.openhab.org")) {
-            Log.d(TAG, "Remote URL " + remoteUrl + "is not https://my.openhab.org, no GCM registration will be made");
-            return;
-        }
-        mIsMyOpenHAB = true;
-        // Finally, all sanity is done
         Crittercism.setUsername(openHABUsername);
+        OpenHABMainActivity.GCM_SENDER_ID = null;
+        // if no notification settings can be constructed, no GCM registration can be made.
+        if (getNotificationSettings() == null)
+            return;
+
         if (mGcm == null)
             mGcm = GoogleCloudMessaging.getInstance(getApplicationContext());
+
         new AsyncTask<Void, Void, String>() {
             @Override
             protected String doInBackground(Void... params) {
-                try {
-                    mRegId = mGcm.register(GCM_SENDER_ID);
-                    runOnUiThread(new Runnable() {
-                        @Override
-                        public void run() {
-                            String deviceModel = null;
-                            try {
-                                deviceModel = URLEncoder.encode(Build.MODEL, "UTF-8");
-                                String deviceId = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
-                                String regUrl = "https://my.openhab.org/addAndroidRegistration?deviceId=" + deviceId +
-                                        "&deviceModel=" + deviceModel + "&regId=" + mRegId;
-                                mAsyncHttpClient.get(getApplicationContext(), regUrl, new AsyncHttpResponseHandler() {
-                                    @Override
-                                    public void onFailure(int statusCode, Header[] headers, byte[] responseBody, Throwable error) {
-                                        Log.e(TAG, "GCM reg id error: " + error.getMessage());
-                                        if (responseBody != null)
-                                            Log.e(TAG, "Error response = " + new String(responseBody));
-                                    }
+                String deviceId = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
+                GoogleCloudMessageConnector connector =
+                        new GoogleCloudMessageConnector(getNotificationSettings(), deviceId, mGcm);
 
-                                    @Override
-                                    public void onSuccess(int statusCode, Header[] headers, byte[] responseBody) {
-                                        Log.d(TAG, "GCM reg id success");
-                                    }
-                                });
-                            } catch (UnsupportedEncodingException e) {
-                                e.printStackTrace();
-                            }
-
-                        }
-                    });
-                } catch (IOException e) {
-                    e.printStackTrace();
-                    Log.e(TAG, "Error getting GCM ID: " + e.getMessage());
+                if (connector.register()) {
+                    OpenHABMainActivity.GCM_SENDER_ID = getNotificationSettings().getSenderId();
                 }
-                return mRegId;
+                return null;
             }
 
             @Override
-            protected void onPostExecute(String regId) {
-            }
+            protected void onPostExecute(String regId) {}
         }.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, null, null, null);
+    }
+
+    /**
+     * Returns the notification settings object
+     * @return
+     */
+    public NotificationSettings getNotificationSettings() {
+        if (mNotifySettings == null) {
+            // We need settings
+            if (mSettings == null)
+                return null;
+
+            // We need remote URL, username and password, without them we can't connect to openhab-cloud
+            String remoteUrl = mSettings.getString(Constants.PREFERENCE_ALTURL, null);
+            if (TextUtils.isEmpty(remoteUrl) || TextUtils.isEmpty(openHABUsername) || TextUtils.isEmpty(openHABPassword)) {
+                Log.d(TAG, "Remote URL, username or password are empty, no GCM registration will be made");
+                return null;
+            }
+            final URL baseUrl;
+            try {
+                baseUrl = new URL(remoteUrl);
+            } catch(MalformedURLException ex) {
+                Log.d(TAG, "Could not parse the baseURL to an URL: " + ex.getMessage());
+                return null;
+            }
+            SyncHttpClient httpClient = new MySyncHttpClient(this);
+            httpClient.setBasicAuth(getOpenHABUsername(), getOpenHABPassword(), true);
+            httpClient.setTimeout(30000);
+            mNotifySettings = new NotificationSettings(baseUrl, httpClient);
+        }
+        return mNotifySettings;
     }
 
     /**
